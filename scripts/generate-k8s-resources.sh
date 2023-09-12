@@ -1,17 +1,45 @@
-#!/bin/bash -ex
+#!/bin/bash
+# -u
+# -ex
+if [ "${DEBUG}" = true ]; then
+  set -u
+else
+  set -ex
+fi
 
 # Create the deploy/k8s files for each java version of each of the Quarkus services
 # Then add on the ui-super-heroes
 
-INPUT_DIR=src/main/kubernetes
-OUTPUT_DIR=deploy/k8s
+OUTPUT_DIR_K8S=deploy/k8s
+OUTPUT_DIR_HELM=deploy/helm
+
 DEPLOYMENT_TYPES=("kubernetes" "minikube" "openshift" "knative")
+PROJECTS=("rest-villains" "rest-heroes" "rest-fights" "event-statistics")
+KINDS=("java" "native")
+
+JAVA_VERSIONS=(17)
+NATIVE_JAVA_VERSION=17
+# Static initialization of version tuples
+# Each tuple contains, the kind (java or native), the java version and the version tag.
+# Native builds do not use all java versions, but a single one defined in NATIVE_JAVA_VERSION
+VERSION_TUPLES=( )
+for kind in "${KINDS[@]}"
+do
+  if [[ "$kind" == "native" ]]; then
+    VERSION_TUPLES+=( "$kind,$NATIVE_JAVA_VERSION,$kind" )
+  else
+    for javaVersion in "${JAVA_VERSIONS[@]}"
+    do
+      VERSION_TUPLES+=( "$kind,$javaVersion,$kind$javaVersion" )
+    done
+  fi
+done
 
 create_output_file() {
   local output_file=$1
 
   if [[ ! -f "$output_file" ]]; then
-    echo "Creating output file: $output_file"
+    # echo "Creating output file: $output_file"
     touch $output_file
 
     # This is here because of
@@ -29,12 +57,13 @@ do_build() {
   local version_tag=$2
   local javaVersion=$3
   local kind=$4
+
   local container_tag="${version_tag}-latest"
   local git_server_url="${GITHUB_SERVER_URL:=https://github.com}"
   local git_repo="${GITHUB_REPOSITORY:=quarkusio/quarkus-super-heroes}"
   local github_ref_name="${BRANCH:=${GITHUB_REF_NAME:=main}}"
 
-  if [[ "$kind" == "native-" ]]; then
+  if [[ "$kind" == "native" ]]; then
     local mem_limit="128Mi"
     local mem_request="32Mi"
   else
@@ -42,12 +71,12 @@ do_build() {
     local mem_request="256Mi"
   fi
 
-  echo "Generating app resources for $project/$container_tag"
+  echo "Building app resources for $project/$version_tag"
   rm -rf $project/target
 
   printf -v deployment_types_str '%s,' "${DEPLOYMENT_TYPES[@]}"
 
-  $project/mvnw -f $project/pom.xml versions:set clean package \
+  $project/mvnw -q -f $project/pom.xml versions:set clean package \
     -DskipTests \
     -DnewVersion=$container_tag \
     -Dmaven.compiler.release=$javaVersion \
@@ -71,47 +100,140 @@ do_build() {
     -Dquarkus.knative.resources.limits.memory=$mem_limit \
     -Dquarkus.knative.resources.requests.memory=$mem_request \
     -Dquarkus.knative.annotations.\"app.openshift.io/vcs-url\"=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY \
-    -Dquarkus.knative.annotations.\"app.openshift.io/vcs-ref\"=$github_ref_name
+    -Dquarkus.knative.annotations.\"app.openshift.io/vcs-ref\"=$github_ref_name \
+    -Dquarkus.helm.version=1.0.0 \
+    -Dquarkus.helm.name=$project \
+    -Dquarkus.http.insecure-requests=disabled #Until https://github.com/quarkusio/quarkus/pull/33979 goes live (Quarkus 3.2 and backport)
+
+
+    # Bug in Dekorate: https://github.com/dekorateio/dekorate/pull/1217
+    # The spec.type in `service.yml` gets wrongly assigned to `ClusterIP`, but for `minikube` it must be `NodePort`.
+    # K8s generates the right value, but helm gets it wrong.
+    # Solution is to change the default value programmatically, but only for the `minikube` deployment type.
+    yq '.app.serviceType="NodePort"' -i $project/target/helm/minikube/$project/values.yaml
+
 }
 
-process_quarkus_project() {
+process_kubernetes_resources(){
   local project=$1
-  local deployment_type=$2
-  local version_tag=$3
-  local javaVersion=$4
-  local kind=$5
+  local version_tag=$2
+  local deployment_type=$3
+
+  echo "Processing k8s resources for ${project}:${deployment_type}"
+
   local output_filename="${version_tag}-${deployment_type}"
-  local app_generated_input_file="$project/target/kubernetes/${deployment_type}.yml"
-  local project_output_file="$project/$OUTPUT_DIR/${output_filename}.yml"
-  local all_apps_output_file="$OUTPUT_DIR/${output_filename}.yml"
+  local project_k8s_file="$project/$OUTPUT_DIR_K8S/${output_filename}.yml"
+  local all_apps_k8s_file="$OUTPUT_DIR_K8S/${output_filename}.yml"
+  local mvn_k8s_file="$project/target/kubernetes/${deployment_type}.yml"
 
-  rm -rf $project_output_file
+  mkdir -p $OUTPUT_DIR_K8S
+  mkdir -p $project/$OUTPUT_DIR_K8S
+  rm -rf $project_k8s_file
 
-  create_output_file $project_output_file
-  create_output_file $all_apps_output_file
+  create_output_file $project_k8s_file
+  create_output_file $all_apps_k8s_file
 
   # Now merge the generated resources to the top level (deploy/k8s)
-  if [[ -f "$app_generated_input_file" ]]; then
-    echo "Copying app generated input ($app_generated_input_file) to $project_output_file and $all_apps_output_file"
+  if [[ -f "$mvn_k8s_file" ]]; then
+    echo "Adding ${deployment_type} resources from ($mvn_k8s_file) to $project_k8s_file and $all_apps_k8s_file"
 
-    cat $app_generated_input_file >> $project_output_file
-    cat $app_generated_input_file >> $all_apps_output_file
+    cat $mvn_k8s_file >> $project_k8s_file
+    cat $mvn_k8s_file >> $all_apps_k8s_file
+
+  else
+    echo "****** The mvn_k8s_file file does not exit! $mvn_k8s_file  ************"
+    exit 255
   fi
 
   if [[ "$project" == "rest-fights" ]]; then
     # Create a descriptor for all of the downstream services (rest-heroes and rest-villains)
-    local all_downstream_output_file="$project/$OUTPUT_DIR/${output_filename}-all-downstream.yml"
-    local villains_output_file="rest-villains/$OUTPUT_DIR/${output_filename}.yml"
-    local heroes_output_file="rest-heroes/$OUTPUT_DIR/${output_filename}.yml"
+    local all_downstream_output_file="$project/$OUTPUT_DIR_K8S/${output_filename}-all-downstream.yml"
+    local villains_output_file="rest-villains/$OUTPUT_DIR_K8S/${output_filename}.yml"
+    local heroes_output_file="rest-heroes/$OUTPUT_DIR_K8S/${output_filename}.yml"
 
     rm -rf $all_downstream_output_file
 
     create_output_file $all_downstream_output_file
 
-    echo "Copying ${app_generated_input_file}, ${villains_output_file}, and $heroes_output_file to $all_downstream_output_file"
+    echo "Adding ${deployment_type} rest-fights resources ${mvn_k8s_file}, ${villains_output_file}, and $heroes_output_file to $all_downstream_output_file"
     cat $villains_output_file >> $all_downstream_output_file
     cat $heroes_output_file >> $all_downstream_output_file
-    cat $app_generated_input_file >> $all_downstream_output_file
+    cat $mvn_k8s_file >> $all_downstream_output_file
+  fi
+
+  if [ "${DEBUG}" = true ]; then
+     # Order the resources for testing purposes
+    echo "DEBUG: Sorting kubernetes resources at $project_k8s_file"
+    jbang yamlsort@someth2say -yamlpath "kind" -yamlpath "metadata.name" -i "${project_k8s_file}" > "${project_k8s_file}.sort";
+    mv -f "${project_k8s_file}.sort" "${project_k8s_file}"
+  fi
+}
+
+process_helm_resources(){
+    local project=$1
+    local deployment_type=$2
+    local version_tag=$3
+
+    local mvn_helm_dir="$project/target/helm/${deployment_type}/$project"
+    local project_helm_dir="$project/${OUTPUT_DIR_HELM}/${deployment_type}"
+    local all_apps_helm_dir="${OUTPUT_DIR_HELM}/${deployment_type}"
+
+    # Now copy the helm files into the deploy directory (deploy/helm) out of the transient target.
+    if [[ -d "$mvn_helm_dir" ]]; then
+      rm -rf $project_helm_dir
+      mkdir -p $project_helm_dir
+      echo "Copying generated helm chart $mvn_helm_dir to $project_helm_dir"
+      cp -R $mvn_helm_dir/* $project_helm_dir
+    else
+      echo "ERROR: The expected location of the maven generated helm chart is not found: $mvn_helm_dir"
+      exit
+    fi
+
+#    TODO: For rest-fights We should generate two different helm charts, one with "all-downstream" resources, and another without.
+#    if [[ "$project" == "rest-fights" ]]; then
+#      echo "Copying rest villain and heroes ${deployment_type} helm charts to the rest fights one "
+#      mkdir -p "${project_helm_dir}/charts/rest-villains"
+#      cp -R rest-villains/${OUTPUT_DIR_HELM}/${deployment_type}/* "${project_helm_dir}/charts/rest-villains"
+#      mkdir -p "${project_helm_dir}/charts/rest-heroes"
+#      cp -R rest-heroes/${OUTPUT_DIR_HELM}/${deployment_type}/* "${project_helm_dir}/charts/rest-heroes"
+#    fi
+
+#    echo "Copying generated helm chart $project_helm_dir to $all_apps_helm_dir"
+#    rm -rf $all_apps_helm_dir
+#    mkdir -p $all_apps_helm_dir
+#    cp -R $project_helm_dir/* $all_apps_helm_dir
+
+    # Execute templates into a k8s-like resources file.
+    # This is optional, and only enabled for testing purposes
+    if [ "${DEBUG}" = true ]; then
+      local project_helm_generated_dir=$project/deploy/helm/generated
+      mkdir -p $project_helm_generated_dir
+      local project_helm_generated_file=$project_helm_generated_dir/${version_tag}-$deployment_type.yml
+      echo "DEBUG: Applying and sorting helm resources for $project_helm_dir to $project_helm_generated_file"
+      helm template $project $project_helm_dir -f scripts/values-${version_tag}.yml > $project_helm_generated_file || exit
+      jbang yamlsort@someth2say -yamlpath "kind" -yamlpath "metadata.name" -i "$project_helm_generated_file" > "${project_helm_generated_file}.sort";
+      mv -f "${project_helm_generated_file}.sort" "$project_helm_generated_file"
+    fi
+}
+
+process_ui_project() {
+  local deployment_type=$1
+  local version_tag=$2
+  local project="ui-super-heroes"
+  local INPUT_DIR="src/main/kubernetes"
+  local project_input_directory="$project/$INPUT_DIR"
+  local input_file="$project_input_directory/${deployment_type}.yml"
+  local project_k8s_file="$project/$OUTPUT_DIR_K8S/app-${deployment_type}.yml"
+  local all_apps_k8s_file="$OUTPUT_DIR_K8S/${version_tag}-${deployment_type}.yml"
+
+  rm -rf $project_k8s_file
+  mkdir -p $project/$OUTPUT_DIR_K8S
+
+  if [[ -f "$input_file" ]]; then
+    create_output_file $project_k8s_file
+    echo "Adding UI resources at $input_file to $project_k8s_file and $all_apps_k8s_file"
+    cat $input_file >> $project_k8s_file
+    cat $input_file >> $all_apps_k8s_file
   fi
 }
 
@@ -125,7 +247,7 @@ create_monitoring() {
   for deployment_type in "kubernetes" "minikube" "openshift"
   do
     local output_file_name="${monitoring_name}-${deployment_type}.yml"
-    local output_file="$OUTPUT_DIR/$output_file_name"
+    local output_file="$OUTPUT_DIR_K8S/$output_file_name"
     local input_dir="$monitoring_name/k8s"
     create_output_file $output_file
 
@@ -141,39 +263,55 @@ create_monitoring() {
   done
 }
 
-rm -rf $OUTPUT_DIR/*.yml
+main(){
+  rm -rf $OUTPUT_DIR_K8S/*.yml
+  rm -rf OUTPUT_DIR_HELM/*.yml
 
-for kind in "" "native-"
-do
-  # Keeping this if/else here for the future when we might want to build multiple java versions
-  if [[ "$kind" == "native-" ]]; then
-    javaVersions=(17)
-  else
-    javaVersions=(17)
-#    javaVersions=(11 17)
+  local tag
+  local deployment_type
+  local project
+  local kind
+  local javaVersion
+  local version_tag
+
+  if [ "${DEBUG}" = true ]; then
+    echo "Kind,Java Version,Tag:" "${VERSION_TUPLES[@]}"
   fi
 
-  for javaVersion in ${javaVersions[@]}
+  for tag in "${VERSION_TUPLES[@]}"
   do
-    if [[ "$kind" == "native-" ]]; then
-      version_tag="native"
-    else
-      version_tag="${kind}java${javaVersion}"
-    fi
+    OLDIFS="$IFS"; IFS=','; set -- $tag;
+      kind=$1
+      javaVersion=$2
+      version_tag=$3
+    IFS="$OLDIFS"
 
-    for project in "rest-villains" "rest-heroes" "rest-fights" "event-statistics" "ui-super-heroes"
+    for project in "${PROJECTS[@]}"
     do
-      # Generate all the k8s resources for all deployment types in one shot
       do_build $project $version_tag $javaVersion $kind
 
-      for deployment_type in ${DEPLOYMENT_TYPES[@]}
+    done
+
+    for deployment_type in "${DEPLOYMENT_TYPES[@]}"
+    do
+      for project in "${PROJECTS[@]}"
       do
-        # For each deployment type, process the quarkus project
-        process_quarkus_project $project $deployment_type $version_tag $javaVersion $kind
+        process_kubernetes_resources $project $version_tag $deployment_type
+
+        process_helm_resources $project $deployment_type $version_tag
+
       done
     done
-  done
-done
 
-## Handle the monitoring
-create_monitoring
+    for deployment_type in "${DEPLOYMENT_TYPES[@]}"
+    do
+      process_ui_project $deployment_type $version_tag
+    done
+
+  done
+
+  ## Handle the monitoring
+  create_monitoring
+}
+
+main

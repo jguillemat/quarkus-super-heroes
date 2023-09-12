@@ -1,0 +1,8 @@
+---
+app:
+  resources:
+    requests:
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  version: native-latest

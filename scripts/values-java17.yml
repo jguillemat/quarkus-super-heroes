@@ -1,0 +1,8 @@
+---
+app:
+  resources:
+    requests:
+      memory: 256Mi
+    limits:
+      memory: 768Mi
+  version: java17-latest
